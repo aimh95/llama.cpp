@@ -1189,6 +1189,44 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // [EMBTRACE] ──────────────────────────────────────────────────────────
+        // Trace why token_embd.weight lands on CPU_Mapped, not HTP0/HTP0-REPACK.
+        // LLM_TENSOR_TOKEN_EMBD is LLM_TENSOR_LAYER_INPUT → dev_input → cpu_buft_list.
+        // cpu_buft_list never contains HTP buffer types → always CPU.
+        // Env: GGML_EMB_TRACE=1
+        if (tn.tensor == LLM_TENSOR_TOKEN_EMBD) {
+            static int embtrace_enabled = -1;
+            if (embtrace_enabled < 0) {
+                const char * e = getenv("GGML_EMB_TRACE");
+                embtrace_enabled = (e && atoi(e) > 0) ? 1 : 0;
+            }
+            if (embtrace_enabled) {
+                const char * layer_kind =
+                    (info.layer == LLM_TENSOR_LAYER_INPUT)     ? "INPUT"     :
+                    (info.layer == LLM_TENSOR_LAYER_OUTPUT)    ? "OUTPUT"    :
+                    (info.layer == LLM_TENSOR_LAYER_REPEATING) ? "REPEATING" : "?";
+                LLAMA_LOG_INFO("[EMBTRACE][LOAD] name=%s type=%s op=%s"
+                    " layer_kind=%s buft_list_size=%zu"
+                    " selected_buft=%s\n",
+                    tn.str().c_str(), ggml_type_name(t_meta->type), ggml_op_name(op),
+                    layer_kind, buft_list->size(),
+                    ggml_backend_buft_name(buft));
+                LLAMA_LOG_INFO("[EMBTRACE][LOAD]   reason: LLM_TENSOR_TOKEN_EMBD is LAYER_%s"
+                    " -> dev_input -> cpu_buft_list"
+                    " (cpu_buft_list does not include HTP0/HTP0-REPACK)\n",
+                    layer_kind);
+                // Print the buft_list entries that were tried
+                int bi = 0;
+                for (const auto & cur : *buft_list) {
+                    LLAMA_LOG_INFO("[EMBTRACE][LOAD]   buft_list[%d] dev=%s buft=%s\n",
+                        bi++,
+                        cur.first ? ggml_backend_dev_name(cur.first) : "null",
+                        cur.second ? ggml_backend_buft_name(cur.second) : "null");
+                }
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {

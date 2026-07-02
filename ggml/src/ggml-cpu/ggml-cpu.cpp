@@ -170,6 +170,42 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
+    // [OPTRACE][CPU] ──────────────────────────────────────────────────────────
+    // Print GET_ROWS ops entering the CPU backend (first 2 compute calls only).
+    // Env: GGML_OP_TRACE=1
+    {
+        static int optrace_enabled = -1;
+        if (optrace_enabled < 0) {
+            const char * env = getenv("GGML_OP_TRACE");
+            optrace_enabled = (env && atoi(env) > 0) ? 1 : 0;
+        }
+        if (optrace_enabled) {
+            static int optrace_cpu_count = 0;
+            const bool do_log = (optrace_cpu_count++ < 2);
+            if (do_log) {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const struct ggml_tensor * t = cgraph->nodes[i];
+                    if (t->op != GGML_OP_GET_ROWS) { continue; }
+                    const struct ggml_tensor * s0 = t->src[0];
+                    const struct ggml_tensor * s1 = t->src[1];
+                    auto buft_nm = [](const struct ggml_tensor * x) -> const char * {
+                        return (x && x->buffer && x->buffer->buft)
+                            ? ggml_backend_buft_name(x->buffer->buft) : "null";
+                    };
+                    GGML_LOG_INFO(
+                        "[OPTRACE][CPU] idx=%d op=GET_ROWS"
+                        " dst=\"%s\" dst_type=%s dst_buft=%s"
+                        " src0=\"%s\" src0_type=%s src0_buft=%s"
+                        " src1=\"%s\" src1_type=%s src1_buft=%s\n",
+                        i, t->name, ggml_type_name(t->type), buft_nm(t),
+                        s0 ? s0->name : "null", s0 ? ggml_type_name(s0->type) : "?", buft_nm(s0),
+                        s1 ? s1->name : "null", s1 ? ggml_type_name(s1->type) : "?", buft_nm(s1));
+                }
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {

@@ -78,6 +78,15 @@ static int opt_opfusion = 1;    // enable/disable op fusion
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
+// Experimental: force GET_ROWS with Q4_0 src0 onto HTP via tiled-REPACK dequantization.
+// Token embedding weights stay in CPU_REPACK by default because op_get_rows() only
+// handles F32 src0. Setting this to 1 expands the support check to Q4_0 and routes
+// the lookup through a tiled-dequant kernel on the DSP (see htp/get-rows-ops.c).
+// Set to 0 to revert to the original F32-only behavior.
+#ifndef FORCE_GET_ROWS_HTP
+#define FORCE_GET_ROWS_HTP 1
+#endif
+
 #define HEX_VERBOSE(...) \
     if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
 
@@ -2935,13 +2944,12 @@ static bool ggml_hexagon_supported_set_rows(const struct ggml_hexagon_session * 
 }
 
 static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
-    const struct ggml_tensor * src0 = op->src[0]; // values
+    const struct ggml_tensor * src0 = op->src[0]; // values (embedding table)
     const struct ggml_tensor * src1 = op->src[1]; // indices
     const struct ggml_tensor * dst  = op;
 
-    if (src0->type != GGML_TYPE_F32) {
-        return false;
-    }
+    const char * buft_name = (src0->buffer && src0->buffer->buft && src0->buffer->buft->iface.get_name)
+        ? src0->buffer->buft->iface.get_name(src0->buffer->buft) : "null";
 
     if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
         return false;
@@ -2951,7 +2959,36 @@ static bool ggml_hexagon_supported_get_rows(const struct ggml_hexagon_session * 
         return false;
     }
 
-    return true;
+    if (src0->type == GGML_TYPE_F32) {
+        HEX_VERBOSE("ggml-hex: supported_get_rows op=%s src0=%s type=F32 shape=[%ld,%ld] buft=%s -> true\n",
+            ggml_op_name(op->op), src0->name, (long)src0->ne[0], (long)src0->ne[1], buft_name);
+        return true;
+    }
+
+#if FORCE_GET_ROWS_HTP
+    if (src0->type == GGML_TYPE_Q4_0) {
+        // Allow only when src0 is in HTP REPACK buffer (tiled layout the DSP kernel understands)
+        // or buffer is not yet assigned during the graph-planning pass.
+        const bool not_yet_placed = (src0->buffer == nullptr);
+        const bool in_repack      = src0->buffer && ggml_backend_buffer_is_hexagon_repack(src0->buffer);
+        const bool result         = not_yet_placed || in_repack;
+
+        GGML_LOG_INFO("ggml-hex: [FORCE_GET_ROWS_HTP] op=%s src0=\"%s\" type=Q4_0"
+            " shape=[%ld,%ld] buft=%s not_yet_placed=%d in_repack=%d -> %s (%s)\n",
+            ggml_op_name(op->op), src0->name,
+            (long)src0->ne[0], (long)src0->ne[1], buft_name,
+            (int)not_yet_placed, (int)in_repack,
+            result ? "true" : "false",
+            result ? "Q4_0 tiled-dequant on DSP" : "not in REPACK, rejected");
+        return result;
+    }
+#endif
+
+    GGML_LOG_DEBUG("ggml-hex: supported_get_rows op=%s src0=\"%s\" type=%s"
+        " shape=[%ld,%ld] buft=%s -> false (unsupported src0 type)\n",
+        ggml_op_name(op->op), src0->name, ggml_type_name(src0->type),
+        (long)src0->ne[0], (long)src0->ne[1], buft_name);
+    return false;
 }
 
 static bool ggml_hexagon_supported_argsort(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
@@ -3394,6 +3431,28 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     (struct htp_mm_kernel_params *)node.kernel_params
                 );
             }
+#if FORCE_GET_ROWS_HTP
+            // Pack tiled-layout parameters for Q4_0 GET_ROWS so the DSP kernel can
+            // compute tile offsets without relying on nb[1] (which is set to the
+            // row-major stride, not the tiled stride, for REPACK buffers).
+            // kernel_params[0] = 1 → Q4_0 REPACK path; [1] = n_k_tiles; [2] = n_col_tiles.
+            if (node.opcode == HTP_OP_GET_ROWS) {
+                const struct ggml_tensor * src0 = node.node->src[0];
+                if (src0->type == GGML_TYPE_Q4_0 && src0->buffer &&
+                        ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+                    const int64_t ne0_padded = hex_round_up(src0->ne[0], 32);
+                    const int64_t ne1_padded = hex_round_up(src0->ne[1], 32);
+                    int32_t * kp = node.kernel_params;
+                    kp[0] = 1;                           // is_q4_0_repack flag
+                    kp[1] = (int32_t)(ne0_padded / 32); // n_k_tiles
+                    kp[2] = (int32_t)(ne1_padded / 32); // n_col_tiles
+                    GGML_LOG_INFO("ggml-hex: [FORCE_GET_ROWS_HTP] GET_ROWS Q4_0 precompute:"
+                        " src0=\"%s\" ne0=%ld ne1=%ld ne0_padded=%ld n_k_tiles=%d n_col_tiles=%d\n",
+                        src0->name, (long)src0->ne[0], (long)src0->ne[1],
+                        (long)ne0_padded, kp[1], kp[2]);
+                }
+            }
+#endif
             computed_nodes.push_back(std::move(node));
         }
 
@@ -3405,6 +3464,54 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             nodes_ptr = &computed_nodes;
         }
     }
+
+    // [OPTRACE][HTP] ──────────────────────────────────────────────────────────
+    // Print node assignment the first time a graph is built (cache miss).
+    // On subsequent decode steps the same uid hits the cache so we skip.
+    // Env: GGML_OP_TRACE=1
+    if (!cache_hit) {
+        static int optrace_enabled = -1;
+        if (optrace_enabled < 0) {
+            const char * env = getenv("GGML_OP_TRACE");
+            optrace_enabled = (env && atoi(env) > 0) ? 1 : 0;
+        }
+        if (optrace_enabled) {
+            GGML_LOG_INFO("[OPTRACE][HTP] %s n_htp_ops=%d graph_uid=%u\n",
+                sess->c_name(), (int)nodes_ptr->size(), (unsigned)graph->uid);
+            int idx = 0;
+            for (const auto & nd : *nodes_ptr) {
+                const ggml_tensor * t  = nd.node;
+                const ggml_tensor * s0 = t->src[0];
+                const ggml_tensor * s1 = t->src[1];
+                // Buffer type name via the iface (same pattern used in supported_get_rows).
+                auto buft_nm = [](const ggml_tensor * x) -> const char * {
+                    return (x && x->buffer && x->buffer->buft && x->buffer->buft->iface.get_name)
+                        ? x->buffer->buft->iface.get_name(x->buffer->buft) : "null";
+                };
+                if (t->op == GGML_OP_GET_ROWS) {
+                    // Full format for the tensor we care about most.
+                    GGML_LOG_INFO(
+                        "[OPTRACE][HTP] idx=%d op=GET_ROWS"
+                        " dst=\"%s\" dst_type=%s dst_buft=%s"
+                        " src0=\"%s\" src0_type=%s src0_buft=%s"
+                        " src1=\"%s\" src1_type=%s src1_buft=%s\n",
+                        idx, t->name, ggml_type_name(t->type), buft_nm(t),
+                        s0 ? s0->name : "null", s0 ? ggml_type_name(s0->type) : "?", buft_nm(s0),
+                        s1 ? s1->name : "null", s1 ? ggml_type_name(s1->type) : "?", buft_nm(s1));
+                } else {
+                    // Abbreviated for all other ops (op name + dst only).
+                    GGML_LOG_INFO(
+                        "[OPTRACE][HTP] idx=%d op=%s dst=\"%s\" dst_type=%s dst_buft=%s"
+                        " src0=\"%s\" src0_buft=%s\n",
+                        idx, ggml_op_name(t->op),
+                        t->name, ggml_type_name(t->type), buft_nm(t),
+                        s0 ? s0->name : "null", buft_nm(s0));
+                }
+                idx++;
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
@@ -3635,6 +3742,30 @@ static void ggml_backend_hexagon_device_get_props(ggml_backend_dev_t dev, struct
 
 static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_buffer_type(ggml_backend_dev_t dev) {
     auto sess = static_cast<ggml_hexagon_session *>(dev->context);
+
+    // [EMBTRACE][BUFT] ────────────────────────────────────────────────────────
+    // Log once: confirms HTP default buffer type exists.
+    // Note: this buffer type enters gpu_buft_list (for LAYER_REPEATING/OUTPUT)
+    // but NOT cpu_buft_list (for LAYER_INPUT = token_embd.weight).
+    {
+        static int embtrace_enabled = -1;
+        if (embtrace_enabled < 0) {
+            const char * e = getenv("GGML_EMB_TRACE");
+            embtrace_enabled = (e && atoi(e) > 0) ? 1 : 0;
+        }
+        if (embtrace_enabled) {
+            static bool embtrace_buft_logged = false;
+            if (!embtrace_buft_logged) {
+                embtrace_buft_logged = true;
+                GGML_LOG_INFO("[EMBTRACE][BUFT] %s default_buft=%s"
+                    " (added to gpu_buft_list, NOT to cpu_buft_list)\n",
+                    sess->c_name(),
+                    ggml_backend_hexagon_buffer_type_name(&sess->buffer_type));
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     return &sess->buffer_type;
 }
 
@@ -3943,6 +4074,32 @@ static ggml_backend_buffer_type_t * ggml_backend_hexagon_device_get_extra_buffer
     static ggml_backend_buffer_type_t bufts[2];
     bufts[0] = ggml_backend_hexagon_device_get_repack_buffer_type(dev);
     bufts[1] = NULL;
+
+    // [EMBTRACE][BUFT] ────────────────────────────────────────────────────────
+    // Log once: HTP extra buft (HTP0-REPACK) is returned here.
+    // It gets added to gpu_buft_list (for transformer block weights).
+    // It is NOT added to cpu_buft_list, so token_embd.weight (LAYER_INPUT)
+    // never sees HTP0-REPACK as a placement candidate.
+    {
+        static int embtrace_enabled = -1;
+        if (embtrace_enabled < 0) {
+            const char * e = getenv("GGML_EMB_TRACE");
+            embtrace_enabled = (e && atoi(e) > 0) ? 1 : 0;
+        }
+        if (embtrace_enabled) {
+            static bool embtrace_extra_logged = false;
+            if (!embtrace_extra_logged) {
+                embtrace_extra_logged = true;
+                GGML_LOG_INFO("[EMBTRACE][BUFT] %s extra_buft=%s"
+                    " (added to gpu_buft_list for LAYER_REPEATING weights,"
+                    " NOT to cpu_buft_list for LAYER_INPUT = token_embd.weight)\n",
+                    s0->c_name(),
+                    bufts[0] ? ggml_backend_hexagon_buffer_type_name(bufts[0]) : "null");
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     return bufts;
 }
 

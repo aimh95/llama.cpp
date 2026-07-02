@@ -1538,9 +1538,30 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// [OPTRACE] ───────────────────────────────────────────────────────────────────
+// Helpers for GGML_OP_TRACE per-node backend assignment logging.
+static inline const char * optrace_buft_name(const struct ggml_tensor * t) {
+    return (t && t->buffer && t->buffer->buft) ? ggml_backend_buft_name(t->buffer->buft) : "null";
+}
+static inline bool optrace_enabled_check(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_OP_TRACE"); v = (e && atoi(e) > 0) ? 1 : 0; }
+    return v > 0;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    // [OPTRACE][SCHED] ────────────────────────────────────────────────────────
+    static int optrace_sched_count = 0;
+    const bool optrace_sched = optrace_enabled_check() && (optrace_sched_count++ < 2);
+    if (optrace_sched) {
+        GGML_LOG_INFO("[OPTRACE][SCHED] call=%d n_splits=%d\n",
+            optrace_sched_count, sched->n_splits);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1550,6 +1571,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // [OPTRACE][SCHED] ────────────────────────────────────────────────────
+        if (optrace_sched) {
+            GGML_LOG_INFO("[OPTRACE][SCHED] split=%d backend=%s n_nodes=%d n_inputs=%d\n",
+                split_id, ggml_backend_name(split_backend),
+                split->graph.n_nodes, split->n_inputs);
+            // Only print GET_ROWS nodes to avoid log explosion.
+            for (int j = 0; j < split->graph.n_nodes; j++) {
+                struct ggml_tensor * t = split->graph.nodes[j];
+                if (t->op != GGML_OP_GET_ROWS) { continue; }
+                const struct ggml_tensor * s0 = t->src[0];
+                const struct ggml_tensor * s1 = t->src[1];
+                GGML_LOG_INFO(
+                    "[OPTRACE][SCHED]   GET_ROWS"
+                    " dst=\"%s\" dst_type=%s dst_buft=%s"
+                    " src0=\"%s\" src0_type=%s src0_buft=%s"
+                    " src1=\"%s\" src1_type=%s src1_buft=%s\n",
+                    t->name,  ggml_type_name(t->type),  optrace_buft_name(t),
+                    s0 ? s0->name : "null", s0 ? ggml_type_name(s0->type) : "?", optrace_buft_name(s0),
+                    s1 ? s1->name : "null", s1 ? ggml_type_name(s1->type) : "?", optrace_buft_name(s1));
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {

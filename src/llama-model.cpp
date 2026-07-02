@@ -1286,6 +1286,51 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
+    // [EMBTRACE] ──────────────────────────────────────────────────────────────
+    // Explain why token_embd.weight (LAYER_INPUT) is excluded from HTP placement.
+    // dev_input is hardcoded to cpu_dev + cpu_buft_list here.
+    // gpu_buft_list DOES include HTP0/HTP0-REPACK (added in make_gpu_buft_list),
+    // but it is only used for LAYER_REPEATING and LAYER_OUTPUT tensors (dev_layer, dev_output).
+    // Env: GGML_EMB_TRACE=1
+    {
+        static int embtrace_enabled = -1;
+        if (embtrace_enabled < 0) {
+            const char * e = getenv("GGML_EMB_TRACE");
+            embtrace_enabled = (e && atoi(e) > 0) ? 1 : 0;
+        }
+        if (embtrace_enabled) {
+            LLAMA_LOG_INFO("[EMBTRACE][LOAD] dev_input assignment:"
+                " dev=%s buft=%s n_cpu_buft_list=%zu\n",
+                ggml_backend_dev_name(cpu_dev),
+                ggml_backend_buft_name(pimpl->cpu_buft_list.front().second),
+                pimpl->cpu_buft_list.size());
+            LLAMA_LOG_INFO("[EMBTRACE][LOAD]   token_embd.weight is LAYER_INPUT"
+                " -> will use cpu_buft_list (no HTP entries)\n");
+            int bi = 0;
+            for (const auto & cur : pimpl->cpu_buft_list) {
+                LLAMA_LOG_INFO("[EMBTRACE][BUFT]   cpu_buft_list[%d] dev=%s buft=%s\n",
+                    bi++,
+                    cur.first ? ggml_backend_dev_name(cur.first) : "null",
+                    cur.second ? ggml_backend_buft_name(cur.second) : "null");
+            }
+            // Show what gpu_buft_list contains for the first HTP device (if any)
+            for (const auto & [gdev, gbuft_list] : pimpl->gpu_buft_list) {
+                LLAMA_LOG_INFO("[EMBTRACE][BUFT]   gpu_buft_list dev=%s n_entries=%zu"
+                    " (used for LAYER_REPEATING/OUTPUT, NOT for token_embd)\n",
+                    ggml_backend_dev_name(gdev), gbuft_list.size());
+                int gi = 0;
+                for (const auto & cur : gbuft_list) {
+                    LLAMA_LOG_INFO("[EMBTRACE][BUFT]     gpu_buft_list[%d] dev=%s buft=%s\n",
+                        gi++,
+                        cur.first ? ggml_backend_dev_name(cur.first) : "null",
+                        cur.second ? ggml_backend_buft_name(cur.second) : "null");
+                }
+                break;  // only first GPU device is enough
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {

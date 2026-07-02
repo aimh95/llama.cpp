@@ -148,9 +148,127 @@ static void get_rows_thread_f32_f32_hvx(unsigned int nth, unsigned int ith, void
          ne00, ne01, ne02, ne03, ir0, ir1, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, (unsigned) qt);
 }
 
+// Q4_0 tiled-REPACK constants (must match HTP_MM_WEIGHT_TILE_SIZE_Q4_0 = 576 in matmul-ops.h).
+// Layout per tile: 512 bytes quants (32 rows x 16 column-pairs x 2 nibbles, packed column-major)
+//                 + 64 bytes fp16 scales (32 rows x 2 bytes)
+// Tile ordering: tile[col_tile * n_k_tiles + k_tile] at stride GET_ROWS_Q4_0_TILE_SIZE.
+// Within tile: byte[cp * 32 + row_in_tile] = (q[row][2*cp+1] << 4) | q[row][2*cp]
+// kernel_params[0]=1 selects this path; [1]=n_k_tiles is set by the host.
+#define GET_ROWS_Q4_0_TILE_QUANTS_SIZE 512
+#define GET_ROWS_Q4_0_TILE_SIZE        576
+
+static inline float get_rows_fp16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        f = sign;  // zero / denormal → treat as 0 for this experimental path
+    } else if (exp == 31) {
+        f = sign | 0x7F800000u | (mant << 13);  // Inf / NaN passthrough
+    } else {
+        f = sign | ((exp + (127u - 15u)) << 23) | (mant << 13);
+    }
+    float result;
+    memcpy(&result, &f, sizeof(f));
+    return result;
+}
+
+// Dequantize one row from a tiled Q4_0 REPACK buffer into a float32 output row.
+// One thread per output row (nr total tasks, no chunking).
+static void get_rows_thread_q4_0_tiled(unsigned int nth, unsigned int ith, void *data) {
+    struct get_rows_context * grctx = (struct get_rows_context *)data;
+    struct htp_ops_context  * octx  = grctx->octx;
+    get_rows_preamble;
+
+    const uint32_t n_k_tiles = (uint32_t) octx->kernel_params[1];
+
+    const uint32_t dr  = grctx->tasks_per_thread;
+    const uint32_t ir0 = dr * ith;
+    if (ir0 >= grctx->total_tasks) {
+        return;
+    }
+    const uint32_t ir1 = MIN(ir0 + dr, grctx->total_tasks);
+
+    const bool     is_i32    = (octx->src[1]->type == HTP_TYPE_I32);
+    const uint8_t *src0_data = (const uint8_t *) octx->src[0]->data;
+
+    for (uint32_t i = ir0; i < ir1; ++i) {
+        const uint32_t i12 = fastdiv(i, &grctx->get_rows_div_ne10_ne11);
+        const uint32_t rem = i - i12 * ne11 * ne10;
+        const uint32_t i11 = fastdiv(rem, &grctx->get_rows_div_ne10);
+        const uint32_t i10 = rem - i11 * ne10;
+
+        const uintptr_t src1_addr = octx->src[1]->data + i10*nb10 + i11*nb11 + i12*nb12;
+        uint32_t i01 = is_i32 ? *(const int32_t *)src1_addr
+                               : (uint32_t)*(const int64_t *)src1_addr;
+
+        if (i01 >= ne01) {
+            continue;  // out-of-vocab index, skip
+        }
+
+        float *dst_row = (float *)((uint8_t *)octx->dst->data + i10*nb1 + i11*nb2 + i12*nb3);
+
+        // Locate this row's tile group.
+        // Tiled layout: rows [ct*32 .. ct*32+31] share the same col-tile group.
+        const uint32_t ct          = i01 / 32;
+        const uint32_t row_in_tile = i01 % 32;
+
+        // Iterate over k-tiles (covers ne0 elements in groups of 32).
+        for (uint32_t kt = 0; kt < n_k_tiles; kt++) {
+            const uint8_t *tile = src0_data +
+                (ct * n_k_tiles + kt) * GET_ROWS_Q4_0_TILE_SIZE;
+
+            // Scale (fp16) for this row within the tile.
+            const uint16_t scale_raw = *(const uint16_t *)(tile + GET_ROWS_Q4_0_TILE_QUANTS_SIZE
+                                                            + row_in_tile * 2u);
+            const float scale = get_rows_fp16_to_f32(scale_raw);
+
+            float *out = dst_row + kt * 32;
+            for (uint32_t e = 0; e < 32; e++) {
+                // byte[cp * 32 + row] = (q[2*cp+1] << 4) | q[2*cp]
+                const uint32_t cp   = e >> 1;
+                const uint8_t  byte = tile[cp * 32 + row_in_tile];
+                const int      q    = (e & 1) ? (byte >> 4) : (byte & 0xF);
+                out[e] = (float)(q - 8) * scale;
+            }
+        }
+    }
+}
+
 int op_get_rows(struct htp_ops_context * octx) {
     get_rows_preamble;
 
+    // Q4_0 tiled-REPACK path (FORCE_GET_ROWS_HTP=1 on host side).
+    // kernel_params[0]==1 is set by ggml-hexagon.cpp when src0 is Q4_0 in REPACK buffer.
+    if (octx->src[0]->type == HTP_TYPE_Q4_0 && octx->kernel_params[0] == 1) {
+        if (octx->dst->type != HTP_TYPE_F32) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+        if (octx->src[1]->type != HTP_TYPE_I32 && octx->src[1]->type != HTP_TYPE_I64) {
+            return HTP_STATUS_NO_SUPPORT;
+        }
+        if (octx->flags & HTP_OPFLAGS_SKIP_COMPUTE) {
+            return HTP_STATUS_OK;
+        }
+
+        struct get_rows_context grctx;
+        grctx.octx                       = octx;
+        grctx.get_rows_div_ne10          = init_fastdiv_values(octx->src[1]->ne[0]);
+        grctx.get_rows_div_ne10_ne11     = init_fastdiv_values(octx->src[1]->ne[0] * octx->src[1]->ne[1]);
+        grctx.get_rows_div_chunks_per_row = init_fastdiv_values(1);
+        grctx.chunks_per_row             = 1;
+        grctx.chunk_size                 = ne00;
+        grctx.total_tasks                = nr;
+
+        const uint32_t n_threads = MIN(nr, octx->n_threads);
+        grctx.tasks_per_thread   = (nr + n_threads - 1) / n_threads;
+
+        worker_pool_run_func(octx->ctx->worker_pool, get_rows_thread_q4_0_tiled, &grctx, n_threads);
+        return HTP_STATUS_OK;
+    }
+
+    // Original F32 path.
     if (octx->src[0]->type != HTP_TYPE_F32) {
         return HTP_STATUS_NO_SUPPORT;
     }
