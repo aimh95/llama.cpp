@@ -2461,12 +2461,13 @@ ggml_status llama_context::graph_compute(
             char nodes_path[512];
             snprintf(nodes_path, sizeof(nodes_path), "%s/graph_nodes.txt", out_dir);
             FILE * fp = fopen(nodes_path, "w");
+            const int n_nodes = ggml_graph_n_nodes(gf);
             if (fp) {
-                fprintf(fp, "# DUMP_GGML_GRAPH node list  n_nodes=%d  n_leafs=%d\n", gf->n_nodes, gf->n_leafs);
+                fprintf(fp, "# DUMP_GGML_GRAPH node list  n_nodes=%d\n", n_nodes);
                 fprintf(fp, "%-5s  %-40s  %-18s  %-8s  %-32s  %-28s  %-28s  %s\n",
                         "idx", "name", "op", "type", "shape(ne[0..3])", "src0", "src1", "buffer");
-                for (int i = 0; i < gf->n_nodes; i++) {
-                    struct ggml_tensor * n = gf->nodes[i];
+                for (int i = 0; i < n_nodes; i++) {
+                    struct ggml_tensor * n = ggml_graph_node(gf, i);
                     if (!n) continue;
 
                     const char * buf_name = "none";
@@ -2499,7 +2500,7 @@ ggml_status llama_context::graph_compute(
                                    shape_str, src0_name, src1_name, buf_name);
                 }
                 fclose(fp);
-                LLAMA_LOG_INFO("[GRAPHDUMP] node list written to %s  (n_nodes=%d)\n", nodes_path, gf->n_nodes);
+                LLAMA_LOG_INFO("[GRAPHDUMP] node list written to %s  (n_nodes=%d)\n", nodes_path, n_nodes);
             } else {
                 LLAMA_LOG_WARN("[GRAPHDUMP] failed to open %s for writing\n", nodes_path);
             }
