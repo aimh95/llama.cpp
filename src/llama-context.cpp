@@ -11,12 +11,15 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "ggml-backend.h"
 
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <cstdio>
+#include <sys/stat.h>
 
 //
 // llama_context
@@ -2435,6 +2438,81 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    // [GRAPHDUMP] DUMP_GGML_GRAPH=1: dump full graph node list + .dot file before compute
+    {
+        static int graphdump_enabled = -1;
+        if (graphdump_enabled < 0) {
+            const char * e = getenv("DUMP_GGML_GRAPH");
+            graphdump_enabled = (e && atoi(e) > 0) ? 1 : 0;
+        }
+        static int graphdump_call_count = 0;
+        if (graphdump_enabled && graphdump_call_count == 0) {
+            graphdump_call_count++;
+
+            const char * out_dir = "experiments/graph_dump";
+#ifdef _WIN32
+            _mkdir(out_dir);
+#else
+            mkdir(out_dir, 0755);
+#endif
+            // --- graph_nodes.txt ---
+            char nodes_path[512];
+            snprintf(nodes_path, sizeof(nodes_path), "%s/graph_nodes.txt", out_dir);
+            FILE * fp = fopen(nodes_path, "w");
+            if (fp) {
+                fprintf(fp, "# DUMP_GGML_GRAPH node list  n_nodes=%d  n_leafs=%d\n", gf->n_nodes, gf->n_leafs);
+                fprintf(fp, "%-5s  %-40s  %-18s  %-8s  %-32s  %-28s  %-28s  %s\n",
+                        "idx", "name", "op", "type", "shape(ne[0..3])", "src0", "src1", "buffer");
+                for (int i = 0; i < gf->n_nodes; i++) {
+                    struct ggml_tensor * n = gf->nodes[i];
+                    if (!n) continue;
+
+                    const char * buf_name = "none";
+                    if (n->buffer) {
+                        buf_name = ggml_backend_buffer_name(n->buffer);
+                    }
+
+                    const char * src0_name = (n->src[0]) ? n->src[0]->name : "-";
+                    const char * src1_name = (n->src[1]) ? n->src[1]->name : "-";
+
+                    char shape_str[64];
+                    snprintf(shape_str, sizeof(shape_str), "[%lld,%lld,%lld,%lld]",
+                             (long long)n->ne[0], (long long)n->ne[1],
+                             (long long)n->ne[2], (long long)n->ne[3]);
+
+                    fprintf(fp, "%-5d  %-40s  %-18s  %-8s  %-32s  %-28s  %-28s  %s\n",
+                            i,
+                            n->name[0] ? n->name : "(unnamed)",
+                            ggml_op_name(n->op),
+                            ggml_type_name(n->type),
+                            shape_str,
+                            src0_name,
+                            src1_name,
+                            buf_name);
+
+                    // also log to stderr for quick inspection
+                    LLAMA_LOG_INFO("[GRAPHDUMP][%d] %-38s  op=%-18s  type=%-8s  shape=%-32s  src0=%-26s  src1=%-26s  buf=%s\n",
+                                   i, n->name[0] ? n->name : "(unnamed)",
+                                   ggml_op_name(n->op), ggml_type_name(n->type),
+                                   shape_str, src0_name, src1_name, buf_name);
+                }
+                fclose(fp);
+                LLAMA_LOG_INFO("[GRAPHDUMP] node list written to %s  (n_nodes=%d)\n", nodes_path, gf->n_nodes);
+            } else {
+                LLAMA_LOG_WARN("[GRAPHDUMP] failed to open %s for writing\n", nodes_path);
+            }
+
+            // --- graph.dot ---
+            char dot_path[512];
+            snprintf(dot_path, sizeof(dot_path), "%s/graph.dot", out_dir);
+            ggml_graph_dump_dot(gf, NULL, dot_path);
+            LLAMA_LOG_INFO("[GRAPHDUMP] dot file written to %s\n", dot_path);
+
+            // --- ggml_graph_print to stderr ---
+            ggml_graph_print(gf);
+        }
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
